@@ -1,0 +1,2 @@
+# Cliente oficial de Confluent para Kafka (basado en librdkafka)
+confluent-kafka>=2.6,<3
