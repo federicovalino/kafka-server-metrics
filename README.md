@@ -1,6 +1,9 @@
-# Monitoreo de métricas de infraestructura en tiempo real con Apache Kafka
+# Monitoreo de métricas de infraestructura en tiempo real con Apache Kafka y Spark
 
-Sistema de mensajería asincrónica que simula el monitoreo de servidores. Un **producer** en Python publica métricas sintéticas de CPU y memoria en el tópico `server_metrics`, de **3 particiones**, en un clúster Kafka local con Docker. Un **consumer**, parte de un consumer group, las procesa en tiempo real y emite una **alerta** cuando un valor supera el 80 %.
+Pipeline de streaming que simula el monitoreo de servidores:
+
+- **Kafka (unidad 3):** un **producer** en Python publica métricas sintéticas de CPU y memoria en el tópico `server_metrics`, de **3 particiones**, en un clúster Kafka local con Docker. Un **consumer**, parte de un consumer group, las procesa en tiempo real y emite una **alerta** cuando un valor supera el 80 %.
+- **Spark (unidad 4):** un job de **Spark Structured Streaming** (`spark/streaming_processor.py`) consume el mismo tópico y, con DataFrames, filtra registros inválidos, calcula el nivel de cada lectura y agrega promedios, máximos y conteos por servidor en **ventanas de 1 minuto**. Ver [Procesamiento distribuido con Spark](#procesamiento-distribuido-con-apache-spark).
 
 ## Arquitectura
 
@@ -13,16 +16,20 @@ Sistema de mensajería asincrónica que simula el monitoreo de servidores. Un **
 3. Los **consumers** del grupo `monitoring-alerts` se reparten las particiones. Cada partición la lee un solo consumidor del grupo.
 4. Un consumer de **otro grupo** (`auditoria`) recibe todos los mensajes, con su propio offset, sin afectar al primer grupo.
 5. Si `value > 80`, el consumer emite un log de nivel `WARNING` con la alerta.
+6. **Spark Structured Streaming** lee el mismo tópico (con su propio offset, como un grupo más) desde la red de Docker, procesa cada micro-batch en 3 tasks paralelas, una por partición, y publica alertas y agregados por ventana en consola.
 
 ## Estructura
 
 ```
 .
-├── docker-compose.yml      # broker KRaft + kafka-init (crea el tópico) + kafka-ui
+├── docker-compose.yml      # broker KRaft + kafka-init (crea el tópico) + kafka-ui + spark
 ├── producer/
 │   └── producer.py         # genera métricas y las publica cada 2 s
 ├── consumer/
 │   └── consumer.py         # consumer group + alerta si value > 80
+├── spark/
+│   ├── streaming_processor.py   # Spark Structured Streaming: filtrado, proyección, ventanas
+│   └── file_feeder.py           # fuente alternativa: eventos como archivos JSON
 ├── requirements.txt        # confluent-kafka
 ├── docs/                   # diagrama y capturas
 └── README.md
@@ -102,7 +109,7 @@ pip install -r requirements.txt
 python producer/producer.py
 ```
 
-Opciones: `--interval 1` (segundos entre mensajes), `--count 50` (detenerse después de N mensajes), `--spike-rate 0.5` (más alertas).
+Opciones: `--interval 1` (segundos entre mensajes), `--count 50` (detenerse después de N mensajes), `--spike-rate 0.5` (más alertas), `--bad-rate 0.1` (10 % de registros inválidos: valor nulo, fuera de rango o sin `server_id`, para probar el filtrado). El consumer descarta los registros inválidos con un log `ERROR` en lugar de caerse.
 
 ### 4. Ejecutar el consumer (terminal 2)
 
@@ -192,15 +199,138 @@ python consumer/consumer.py --group auditoria --name c3
 
 `c3` recibe las 3 particiones y, por `auto.offset.reset = earliest`, lee **desde el principio** todo lo publicado, incluso lo que `monitoring-alerts` ya procesó. Los dos grupos consumen los mismos datos de forma independiente, cada uno con su propio offset.
 
+## Procesamiento distribuido con Apache Spark
+
+`spark/streaming_processor.py` es un job de **Spark Structured Streaming** que consume `server_metrics` desde Kafka y transforma los eventos crudos en información accionable usando **DataFrames**.
+
+### Arquitectura: Driver, Executors y tasks
+
+Spark corre en el contenedor `spark` con `--master local[3]`: el **Driver** y **3 hilos de ejecución** (que cumplen el rol de Executors) en el mismo proceso.
+
+| Componente | En este proyecto | En un clúster real |
+|---|---|---|
+| **Driver** | El proceso de `spark-submit` que ejecuta `streaming_processor.py`. Arma el plan lógico, lo optimiza y, en cada micro-batch, lo divide en tasks | Un proceso aparte (en un nodo o en un Pod de Kubernetes) |
+| **Cluster Manager** | No hay: `local[3]` asigna los recursos dentro del mismo contenedor | Kubernetes, YARN o Spark Standalone: asigna CPU y memoria a cada Executor |
+| **Executors** | 3 hilos del mismo proceso | Procesos JVM en distintos Workers; cada uno corre varias tasks en paralelo |
+| **Tasks** | 1 task por partición de Kafka en cada micro-batch | Igual: el paralelismo de lectura lo define la cantidad de particiones del tópico |
+
+**Cómo se reparte el trabajo en cada micro-batch (cada 10 s):**
+
+1. El **Driver** consulta a Kafka los offsets nuevos de cada partición y define qué rango le toca a cada task.
+2. Se lanzan **3 tasks de lectura**, una por partición de `server_metrics`. Cada Executor lee su partición, parsea el JSON y aplica el filtrado y la proyección **sin moverse de ahí**: son transformaciones *narrow*, que no necesitan datos de otras particiones.
+3. La agregación por ventana necesita juntar todas las lecturas de un mismo `server_id` y métrica, así que hay un **shuffle**: los datos se redistribuyen por clave en 3 particiones (`spark.sql.shuffle.partitions = 3`) y otras 3 tasks calculan promedio, máximo y conteo, actualizando el estado de cada ventana.
+4. El Driver recibe los resultados y los escribe en el sink (consola).
+
+Escalar es cambiar `local[3]` por un clúster con más Executors **y** subir las particiones del tópico. Con 3 particiones, más de 3 tasks de lectura en paralelo no aportan nada: es el mismo techo que en los consumer groups.
+
+> **Evaluación *lazy*:** `filter`, `withColumn`, `groupBy` no ejecutan nada, solo agregan pasos al plan. Recién `.start()` (la acción) hace que el Driver optimice el plan completo y lo ejecute en cada micro-batch. Sin `.start()` no pasa nada, y sin `awaitAnyTermination()` el script terminaría enseguida y mataría las queries.
+
+### Pipeline de transformaciones
+
+```
+Kafka (value en bytes)
+  └─ from_json con esquema estricto (StructType)      ← en streaming no se puede inferir
+      └─ 1. FILTRADO     timestamp, server_id y value no nulos
+      │                  metric_name ∈ {cpu_usage, memory_usage}
+      │                  value entre 0 y 100
+      └─ 2. PROYECCIÓN   event_time = to_timestamp(timestamp)
+      │                  value → usage_pct (renombrada)
+      │                  nivel = CRITICO (> 80) | ALTO (> 60) | NORMAL
+      ├─ query alertas_criticas      nivel = CRITICO → consola (append)
+      └─ 3. AGREGACIÓN   watermark 30 s + ventana tumbling de 1 min
+                         por server_id y metric_name:
+                         promedio, máximo, lecturas, lecturas críticas
+           └─ query metricas_por_ventana → consola (update)
+```
+
+| Decisión | Por qué |
+|---|---|
+| **Esquema estricto (`StructType`)** | Spark tiene que conocer la estructura antes de que llegue el primer evento. Un campo con tipo incorrecto queda en `null` y el filtrado lo descarta, en lugar de romper el job |
+| **Ventanas por `event_time` (hora del evento), no por hora de llegada** | Las métricas se agrupan según cuándo se midieron, aunque lleguen con demora |
+| **Watermark de 30 s** | Define cuánto se esperan eventos atrasados antes de dar por cerrada una ventana, y le permite a Spark liberar el estado de ventanas viejas en lugar de guardarlo para siempre |
+| **Modo `update` en las ventanas** | En cada micro-batch se imprimen solo las ventanas que cambiaron, con sus valores actualizados. Muestra cómo el promedio de la ventana en curso se recalcula a medida que llegan datos |
+| **Query separada de alertas (`append`)** | Una alerta no puede esperar a que cierre la ventana de 1 minuto: cada lectura crítica se emite en el micro-batch en que llega |
+| **`spark.sql.shuffle.partitions = 3`** | El valor por defecto (200) crearía 200 tasks casi vacías por micro-batch para este volumen. Con 3, coincide con las particiones del tópico |
+| **Spark en Docker, conectado a `kafka:29092`** | Evita instalar Java y Spark en Windows. Como corre dentro de la red de Docker, usa el listener `INTERNAL`, igual que `kafka-ui` |
+
+### Ejecución
+
+Con el clúster de Kafka levantado y el producer corriendo (idealmente con registros inválidos para ver el filtrado):
+
+```bash
+python producer/producer.py --bad-rate 0.1       # terminal 1
+docker compose up spark                           # terminal 2
+```
+
+El servicio `spark` no arranca con `docker compose up -d`: se lanza aparte para ver su salida en la terminal. El primer arranque tarda un poco más porque descarga el conector de Kafka para Spark (`spark-sql-kafka-0-10`). `Ctrl+C` lo detiene.
+
+### Salida
+
+Cada micro-batch imprime las dos queries. Ejemplo de una ejecución real con la fuente de archivos (ver más abajo). Por eso `kafka_partition` y `kafka_offset` salen en `NULL`; leyendo de Kafka muestran la partición y el offset de origen de cada alerta:
+
+```
+-------------------------------------------
+Batch: 2
+-------------------------------------------
++--------+---------+------------+---------+---------------+------------+
+|hora    |server_id|metric_name |usage_pct|kafka_partition|kafka_offset|
++--------+---------+------------+---------+---------------+------------+
+|20:50:15|srv-04   |memory_usage|95.6     |NULL           |NULL        |
+|20:50:15|srv-02   |memory_usage|86.3     |NULL           |NULL        |
++--------+---------+------------+---------+---------------+------------+
+
+-------------------------------------------
+Batch: 3
+-------------------------------------------
++-------------+-------------+---------+------------+------------+----------+--------+-----------------+
+|ventana_desde|ventana_hasta|server_id|metric_name |promedio_pct|maximo_pct|lecturas|lecturas_criticas|
++-------------+-------------+---------+------------+------------+----------+--------+-----------------+
+|20:50:00     |20:51:00     |srv-03   |cpu_usage   |51.5        |65.8      |4       |0                |
+|20:50:00     |20:51:00     |srv-02   |cpu_usage   |37.8        |48.5      |2       |0                |
+|20:50:00     |20:51:00     |srv-01   |cpu_usage   |71.2        |85.9      |3       |2                |
+|20:50:00     |20:51:00     |srv-02   |memory_usage|71.8        |86.4      |4       |2                |
+|20:50:00     |20:51:00     |srv-05   |memory_usage|53.4        |97.5      |4       |1                |
+|20:50:00     |20:51:00     |srv-03   |memory_usage|46.3        |61.8      |6       |0                |
++-------------+-------------+---------+------------+------------+----------+--------+-----------------+
+```
+
+Los registros inválidos (por ejemplo `value = 150` o sin `server_id`) no aparecen ni en las alertas ni en los promedios: los descarta el filtrado. Entre un batch y otro, los valores de la ventana en curso se recalculan (`lecturas` crece, el promedio cambia), que es el procesamiento continuo en acción.
+
+![Salida de Spark Structured Streaming en consola](docs/spark-console.png)
+
+### Spark UI
+
+Mientras corre, `http://localhost:4040` muestra cómo se distribuye el trabajo:
+
+- **Structured Streaming:** las dos queries, su ritmo de entrada y la duración de cada micro-batch.
+- **Jobs / Stages:** cada micro-batch genera stages con **3 tasks**: las de lectura, una por partición de Kafka, y las de la agregación después del shuffle.
+- **Executors:** el Driver y sus recursos.
+
+![Spark UI con las tasks por micro-batch](docs/spark-ui.png)
+
+### Fuente alternativa sin Kafka
+
+El mismo procesador puede leer eventos desde una carpeta de archivos JSON, útil para probar las transformaciones sin levantar el clúster. Requiere PySpark y Java instalados localmente:
+
+```bash
+pip install pyspark==3.5.3
+python spark/file_feeder.py --count 60 --interval 1 --bad-rate 0.1     # terminal 1: genera eventos
+python spark/streaming_processor.py --source files --input-dir spark/input --checkpoint-dir spark-checkpoints   # terminal 2
+```
+
+El esquema, el filtrado, la proyección y las ventanas son exactamente los mismos. Solo cambia la fuente (`readStream.json` en lugar de `readStream.format("kafka")`).
+
 ## Errores comunes y cómo se evitan
 
 | Error | Qué pasaría | Cómo se evita en este proyecto |
 |---|---|---|
 | No crear el tópico antes del producer | Kafka lo autocrea con 1 partición: sin paralelismo | `kafka-init` crea el tópico con 3 particiones y `auto.create.topics = false` impide la autocreación |
-| `bootstrap.servers` mal configurado | El cliente no conecta, o conecta y después falla con una dirección inalcanzable | Listeners `EXTERNAL` (host) e `INTERNAL` (Docker) separados. El producer verifica la conexión y el tópico al arrancar y corta con un mensaje claro |
+| `bootstrap.servers` mal configurado | El cliente no conecta, o conecta y después falla con una dirección inalcanzable | Listeners `EXTERNAL` (host) e `INTERNAL` (Docker) separados. El producer verifica la conexión y el tópico al arrancar y corta con un mensaje claro. Spark, dentro de Docker, usa `kafka:29092` |
+| Leer un stream sin esquema (Spark) | Spark no puede inferir la estructura de datos que todavía no llegaron | `METRIC_SCHEMA` (`StructType`) explícito, aplicado con `from_json` |
+| Olvidar `.start()` o `.awaitTermination()` (Spark) | La query nunca se ejecuta, o el script termina y mata el stream | Cada query termina en `.start()` y el script espera con `spark.streams.awaitAnyTermination()` |
 
 ## Limpieza
 
 ```bash
-docker compose down        # detiene y elimina los contenedores (los datos del tópico se pierden)
+docker compose --profile spark down   # detiene y elimina todos los contenedores, incluido spark (los datos del tópico se pierden)
 ```

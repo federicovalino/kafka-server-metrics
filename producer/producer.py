@@ -11,6 +11,7 @@ misma partición, en orden.
 Uso:
     python producer/producer.py
     python producer/producer.py --interval 1 --count 50
+    python producer/producer.py --bad-rate 0.1      # 10 % de registros inválidos
 """
 
 import argparse
@@ -31,6 +32,7 @@ SERVERS = ["srv-01", "srv-02", "srv-03", "srv-04", "srv-05"]
 METRICS = ["cpu_usage", "memory_usage"]
 DEFAULT_INTERVAL_SECONDS = 2
 DEFAULT_SPIKE_RATE = 0.2  # probabilidad de generar un pico > 80
+DEFAULT_BAD_RATE = 0.0    # probabilidad de un registro inválido (para probar el filtrado en Spark)
 
 
 def generate_value(metric_name: str, spike_rate: float = DEFAULT_SPIKE_RATE) -> float:
@@ -52,6 +54,18 @@ def build_event(server_id: str, metric_name: str, spike_rate: float = DEFAULT_SP
     }
 
 
+def corrupt(event: dict) -> dict:
+    """Simula un registro defectuoso: valor nulo, fuera de rango o sin server_id."""
+    kind = random.choice(["null_value", "out_of_range", "missing_server"])
+    if kind == "null_value":
+        event["value"] = None
+    elif kind == "out_of_range":
+        event["value"] = 150.0
+    else:
+        event.pop("server_id")
+    return event
+
+
 def delivery_report(err, msg) -> None:
     """Callback: Kafka confirma (o no) que el mensaje quedó guardado.
     Muestra en qué partición y offset quedó."""
@@ -59,8 +73,10 @@ def delivery_report(err, msg) -> None:
         print(f"[ERROR] No se pudo entregar el mensaje: {err}", file=sys.stderr)
         return
     event = json.loads(msg.value())
+    value = event.get("value")
+    shown = f"{value:5.1f}%" if isinstance(value, (int, float)) else f"{value!s:>6}"
     print(
-        f"[ENVIADO] {event['server_id']} {event['metric_name']:<12} = {event['value']:5.1f}%"
+        f"[ENVIADO] {event.get('server_id', '<sin id>')} {event['metric_name']:<12} = {shown}"
         f"  ->  partición {msg.partition()}  offset {msg.offset()}"
     )
 
@@ -85,6 +101,8 @@ def main() -> None:
                         help="cantidad de mensajes a enviar (0 = infinito)")
     parser.add_argument("--spike-rate", type=float, default=DEFAULT_SPIKE_RATE,
                         help="probabilidad de un valor > 80 (default: 0.2)")
+    parser.add_argument("--bad-rate", type=float, default=DEFAULT_BAD_RATE,
+                        help="probabilidad de un registro inválido (default: 0)")
     args = parser.parse_args()
 
     producer = Producer({
@@ -104,10 +122,13 @@ def main() -> None:
     sent = 0
     try:
         while args.count == 0 or sent < args.count:
-            event = build_event(random.choice(SERVERS), random.choice(METRICS), args.spike_rate)
+            server_id = random.choice(SERVERS)
+            event = build_event(server_id, random.choice(METRICS), args.spike_rate)
+            if random.random() < args.bad_rate:
+                event = corrupt(event)
             producer.produce(
                 TOPIC,
-                key=event["server_id"],  # misma key -> misma partición -> orden por servidor
+                key=server_id,  # misma key -> misma partición -> orden por servidor
                 value=json.dumps(event).encode("utf-8"),
                 on_delivery=delivery_report,
             )

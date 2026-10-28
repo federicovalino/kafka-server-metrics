@@ -42,6 +42,8 @@ def process(event: dict, partition: int, offset: int, threshold: float = ALERT_T
     """Imprime el evento; si value > threshold, imprime una alerta destacada.
     Devuelve True si se generó una alerta."""
     server, metric, value = event["server_id"], event["metric_name"], float(event["value"])
+    if not 0 <= value <= 100:
+        raise ValueError(f"valor fuera de rango: {value}")
     origin = f"[p{partition} | off {offset}]"
 
     if value > threshold:
@@ -93,8 +95,12 @@ def main() -> None:
                 log.error("[p%s | off %s] Mensaje inválido, se descarta: %r",
                           msg.partition(), msg.offset(), msg.value())
                 continue
-            processed += 1
-            alerts += process(event, msg.partition(), msg.offset(), args.threshold)
+            try:
+                alerts += process(event, msg.partition(), msg.offset(), args.threshold)
+                processed += 1
+            except (KeyError, TypeError, ValueError):
+                log.error("[p%s | off %s] Registro incompleto o inválido, se descarta: %s",
+                          msg.partition(), msg.offset(), event)
     except KeyboardInterrupt:
         pass
     finally:

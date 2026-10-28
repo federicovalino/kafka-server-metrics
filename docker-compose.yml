@@ -82,3 +82,32 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       # OJO: desde la red de Docker se usa el listener INTERNAL, no localhost
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # --- 4. Spark Structured Streaming (unidad 4) ---
+  # No arranca con "docker compose up -d": se lanza aparte con
+  #   docker compose up spark
+  spark:
+    image: spark:3.5.3-scala2.12-java17-python3-ubuntu
+    container_name: spark
+    profiles: ["spark"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "4040:4040" # Spark UI: jobs, stages, tasks y executors
+    volumes:
+      - ./spark:/opt/app:ro
+    environment:
+      # Spark corre dentro de Docker: usa el listener INTERNAL del broker
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[3]                       # Driver + 3 hilos de ejecución (1 por partición de Kafka)
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3   # conector Kafka (se descarga al iniciar)
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - /opt/app/streaming_processor.py
+      - --source
+      - kafka
